@@ -10,12 +10,15 @@ use macroquad::prelude::*;
 use std::collections::HashMap;
 
 pub mod about;
+pub mod blades;
+#[cfg(target_os = "linux")]
 pub mod bluetooth;
 pub mod cd_player;
 pub mod data;
 pub mod dialog;
 pub mod extras_menu;
 pub mod main_menu;
+pub mod retroachievements;
 pub mod runtime_downloader;
 pub mod settings;
 pub mod theme_downloader;
@@ -850,6 +853,102 @@ pub fn text_disabled(font_cache: &HashMap<String, Font>, config: &Config, text :
         //font_size: font_size,
         font_size,
         color: Color {r:0.4, g:0.4, b:0.4, a:1.0},
+        ..Default::default()
+    });
+}
+
+/// Render the mGBA launch options dialog (multiplayer & save file selection)
+pub fn render_mgba_launch_dialog(
+    dialog: &Dialog,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    scale_factor: f32,
+    animation_state: &AnimationState,
+) {
+    let current_font = get_current_font(font_cache, config);
+    let font_size = (FONT_SIZE as f32 * scale_factor) as u16;
+
+    // --- Box Dimensions ---
+    let box_width = 450.0 * scale_factor;
+    let option_height = 30.0 * scale_factor;
+    let padding = 20.0 * scale_factor;
+
+    // Calculate box height based on number of options
+    let desc_lines = dialog.desc.as_ref().map(|d| d.lines().count()).unwrap_or(0);
+    let desc_height = desc_lines as f32 * (font_size as f32 + 5.0 * scale_factor);
+    let options_height = dialog.options.len() as f32 * option_height;
+    let box_height = padding * 2.0 + desc_height + options_height + 20.0 * scale_factor;
+
+    let box_x = screen_width() / 2.0 - box_width / 2.0;
+    let box_y = screen_height() / 2.0 - box_height / 2.0;
+
+    // --- Draw Background and Border ---
+    draw_rectangle(box_x, box_y, box_width, box_height, Color::new(0.0, 0.0, 0.0, 0.9));
+    draw_rectangle_lines(box_x, box_y, box_width, box_height, 2.0 * scale_factor, WHITE);
+
+    // --- Draw Description Text ---
+    let mut content_y = box_y + padding;
+    if let Some(desc) = &dialog.desc {
+        for line in desc.lines() {
+            let text_dims = measure_text(line, Some(current_font), font_size, 1.0);
+            let text_x = screen_width() / 2.0 - text_dims.width / 2.0;
+            text_with_config_color(font_cache, config, line, text_x, content_y + text_dims.height, font_size);
+            content_y += text_dims.height + 5.0 * scale_factor;
+        }
+        content_y += 10.0 * scale_factor;
+    }
+
+    // --- Draw Options ---
+    for (i, option) in dialog.options.iter().enumerate() {
+        let text_dims = measure_text(&option.text, Some(current_font), font_size, 1.0);
+        let text_x = screen_width() / 2.0 - text_dims.width / 2.0;
+        let text_y = content_y + (i as f32 * option_height) + text_dims.height;
+
+        let is_selected = i == dialog.selection;
+
+        if is_selected {
+            // Draw selection cursor
+            let cursor_color = animation_state.get_cursor_color(config);
+            let cursor_scale = animation_state.get_cursor_scale();
+
+            let base_width = text_dims.width + (20.0 * scale_factor);
+            let base_height = text_dims.height + (10.0 * scale_factor);
+            let scaled_width = base_width * cursor_scale;
+            let scaled_height = base_height * cursor_scale;
+            let offset_x = (scaled_width - base_width) / 2.0;
+            let offset_y = (scaled_height - base_height) / 2.0;
+
+            let rect_x = text_x - 10.0 * scale_factor - offset_x;
+            let rect_y = text_y - text_dims.height - 5.0 * scale_factor - offset_y;
+
+            draw_rectangle_lines(
+                rect_x,
+                rect_y,
+                scaled_width,
+                scaled_height,
+                3.0 * scale_factor,
+                cursor_color,
+            );
+        }
+
+        if option.disabled {
+            text_disabled(font_cache, config, &option.text, text_x, text_y, font_size);
+        } else {
+            text_with_config_color(font_cache, config, &option.text, text_x, text_y, font_size);
+        }
+    }
+
+    // --- Draw Instructions ---
+    let instruction_text = "[SOUTH] SELECT    [EAST] BACK";
+    let instruction_size = (12.0 * scale_factor) as u16;
+    let instruction_dims = measure_text(instruction_text, Some(current_font), instruction_size, 1.0);
+    let instruction_x = screen_width() / 2.0 - instruction_dims.width / 2.0;
+    let instruction_y = box_y + box_height - 5.0 * scale_factor;
+
+    draw_text_ex(instruction_text, instruction_x, instruction_y, TextParams {
+        font: Some(current_font),
+        font_size: instruction_size,
+        color: Color::new(0.7, 0.7, 0.7, 1.0),
         ..Default::default()
     });
 }

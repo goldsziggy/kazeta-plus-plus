@@ -1,9 +1,9 @@
 use cd_da_reader::{CdReader, Toc};
-use rodio::{buffer::SamplesBuffer, OutputStream, Sink, Source};
-use rodio::OutputStreamBuilder;
+use rodio::{buffer::SamplesBuffer, Sink, Source};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use crate::audio::AUDIO;
 
 /// Represents the status of the CD player.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,7 +25,6 @@ pub struct CdPlayerBackend {
     pub track_duration: Duration,
 
     // Rodio audio components
-    _stream: Option<OutputStream>, // Must be kept alive
     pub sink: Option<Sink>,
 
     // Thread management
@@ -46,7 +45,6 @@ impl CdPlayerBackend {
             toc: None,
             current_track: 0,
             track_duration: Duration::ZERO,
-            _stream: None,
             sink: None,
             audio_thread_handle: None,
             playback_start_time: None,
@@ -206,14 +204,11 @@ impl CdPlayerBackend {
                     return;
                 }
 
-                let stream = OutputStreamBuilder::open_default_stream()
-                .expect("open default audio stream");
-                let sink = Sink::connect_new(&stream.mixer());
+                let sink = Sink::connect_new(&AUDIO.stream.mixer());
 
                 // [!] Use the buffer we created earlier
                 sink.append(source_buffer.clone()); // Append a clone
 
-                backend._stream = Some(stream);
                 backend.sink = Some(sink);
                 backend.status = PlayerStatus::Playing;
                 backend.playback_start_time = Some(Instant::now());
@@ -268,19 +263,15 @@ impl CdPlayerBackend {
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
-        self._stream.take();
 
-        // Create new stream and sink
-        let new_stream = OutputStreamBuilder::open_default_stream()
-        .expect("Failed to open stream for seek");
-        let new_sink = Sink::connect_new(&new_stream.mixer());
+        // Create new sink using global audio stream
+        let new_sink = Sink::connect_new(&AUDIO.stream.mixer());
 
         // 6. Create new source, skip to the new time, and append
         let new_source = source_data.clone().skip_duration(new_time);
         new_sink.append(new_source);
 
         // 7. Update state
-        self._stream = Some(new_stream);
         self.sink = Some(new_sink);
 
         if self.status == PlayerStatus::Paused {
@@ -298,7 +289,6 @@ impl CdPlayerBackend {
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
-        self._stream.take();
         self.audio_thread_handle.take(); // Drop the handle
         self.playback_start_time = None;
         self.paused_elapsed_time = None;

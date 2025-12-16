@@ -42,7 +42,31 @@ pub struct Config {
     pub logo_selection: String,
     pub background_selection: String,
     pub font_selection: String,
+    // RetroAchievements settings
+    #[serde(default)]
+    pub retroachievements: RetroAchievementsConfig,
 }
+
+/// RetroAchievements configuration
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct RetroAchievementsConfig {
+    /// Whether RetroAchievements integration is enabled
+    #[serde(default = "default_ra_enabled")]
+    pub enabled: bool,
+    /// Whether to use hardcore mode (disables save states, cheats, etc.)
+    #[serde(default)]
+    pub hardcore_mode: bool,
+    /// Whether to show achievement notifications
+    #[serde(default = "default_ra_notifications")]
+    pub show_notifications: bool,
+    /// Duration to show notifications (in milliseconds)
+    #[serde(default = "default_ra_notification_duration")]
+    pub notification_duration: u32,
+}
+
+fn default_ra_enabled() -> bool { true }
+fn default_ra_notifications() -> bool { true }
+fn default_ra_notification_duration() -> u32 { 5000 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -71,6 +95,7 @@ impl Default for Config {
             logo_selection: "Kazeta+ (Default)".to_string(),
             background_selection: "Default".to_string(),
             font_selection: "Default".to_string(),
+            retroachievements: RetroAchievementsConfig::default(),
         }
     }
 }

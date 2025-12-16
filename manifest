@@ -82,6 +82,8 @@ export SERVICES="\
 	inputplumber.service \
 	iwd.service \
 	keyd.service \
+	kazeta-input.service \
+	kazeta-overlay.service \
 	kazeta-profile-loader.service \
 	lightdm.service \
 	NetworkManager.service \
@@ -138,6 +140,9 @@ postinstallhook() {
     # Set permissions for user home and var data
     chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}
     chown -R ${USERNAME}:${USERNAME} /var/kazeta
+
+    # Add user to input group for kazeta-input daemon
+    usermod -aG input ${USERNAME}
 
     # Automount storage to /run/media
     sed -i -e 's,mediadir=/media,mediadir=/run/media,' /usr/bin/media-automount

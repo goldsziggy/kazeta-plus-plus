@@ -13,8 +13,11 @@ pub struct InputState {
     pub cycle: bool,
     pub back: bool,
     pub secondary: bool,
+    pub overlay_hotkey: bool,  // Guide button or F12 key
     pub analog_was_neutral: bool,
     pub ui_focus: UIFocus,
+    // Track Ctrl+O state to detect the combo reliably
+    ctrl_o_last_o_state: bool,
 }
 
 impl InputState {
@@ -32,8 +35,10 @@ impl InputState {
             cycle: false,
             back: false,
             secondary: false,
+            overlay_hotkey: false,
             analog_was_neutral: true,
             ui_focus: UIFocus::Grid,
+            ctrl_o_last_o_state: false,
         }
     }
 
@@ -48,6 +53,7 @@ impl InputState {
         self.cycle = false;
         self.back = false;
         self.secondary = false;
+        self.overlay_hotkey = false;
         // Note: We do NOT reset analog_was_neutral or ui_focus
     }
 
@@ -62,6 +68,25 @@ impl InputState {
         self.back = is_key_pressed(KeyCode::Backspace);
         self.secondary = is_key_pressed(KeyCode::X);
         self.cycle = is_key_pressed(KeyCode::Tab);
+        // Overlay hotkey: F12 key, or Ctrl+O (Ctrl + O key)
+        // Check for Ctrl+O by ensuring Control is held down when O is pressed
+        let ctrl_held = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+        let o_currently_down = is_key_down(KeyCode::O);
+        let o_just_pressed = o_currently_down && !self.ctrl_o_last_o_state;
+        let f12_pressed = is_key_pressed(KeyCode::F12);
+        
+        // Update O key state tracking
+        self.ctrl_o_last_o_state = o_currently_down;
+        
+        // Detect Ctrl+O: Control must be held AND O must have just been pressed
+        let ctrl_o_detected = ctrl_held && o_just_pressed;
+        
+        // Debug: log when Ctrl+O is detected
+        if ctrl_o_detected {
+            println!("[Input] Ctrl+O detected! ctrl_held={}, o_just_pressed={}", ctrl_held, o_just_pressed);
+        }
+        
+        self.overlay_hotkey = f12_pressed || ctrl_o_detected;
     }
 
     pub fn update_controller(&mut self, gilrs: &mut Gilrs) {
@@ -77,6 +102,7 @@ impl InputState {
                 gilrs::EventType::ButtonPressed(Button::West, _) => self.secondary = true,
                 gilrs::EventType::ButtonPressed(Button::RightTrigger, _) => self.next = true,
                 gilrs::EventType::ButtonPressed(Button::LeftTrigger, _) => self.prev = true,
+                gilrs::EventType::ButtonPressed(Button::Mode, _) => self.overlay_hotkey = true,  // Guide button
                 _ => {}
             }
         }

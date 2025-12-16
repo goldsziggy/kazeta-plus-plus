@@ -20,6 +20,7 @@ const MENU_PADDING: f32 = 6.0;
 const SETTINGS_START_Y: f32 = 80.0;
 const SETTINGS_OPTION_HEIGHT: f32 = 20.0;
 
+#[cfg(target_os = "linux")]
 pub const GENERAL_SETTINGS: &[&str] = &[
     "RESET SETTINGS",
     "RESOLUTION",
@@ -30,6 +31,21 @@ pub const GENERAL_SETTINGS: &[&str] = &[
     "WI-FI",
     "BLUETOOTH",
     "AUTOBOOT",
+    "RETROACHIEVEMENTS",
+    "AUDIO SETTINGS",
+];
+
+#[cfg(not(target_os = "linux"))]
+pub const GENERAL_SETTINGS: &[&str] = &[
+    "RESET SETTINGS",
+    "RESOLUTION",
+    "ASPECT RATIO",
+    "SHOW SPLASH SCREEN",
+    "TIME ZONE",
+    "BRIGHTNESS",
+    "WI-FI",
+    "AUTOBOOT",
+    "RETROACHIEVEMENTS",
     "AUDIO SETTINGS",
 ];
 
@@ -243,9 +259,20 @@ pub fn get_settings_value(page: usize, index: usize, config: &Config, system_vol
             4 => config.timezone.clone().to_uppercase(), // TIME ZONE
             5 => format!("{:.0}%", brightness * 100.0), // BRIGHTNESS
             6 => if config.wifi { "ON" } else { "OFF" }.to_string(), // WI-FI
+            #[cfg(target_os = "linux")]
             7 => if config.bluetooth { "ON" } else { "OFF" }.to_string(), // BLUETOOTH
+            #[cfg(target_os = "linux")]
             8 => if config.autoboot { "ON" } else { "OFF" }.to_string(), // AUTOBOOT
-            9 => "->".to_string(),
+            #[cfg(target_os = "linux")]
+            9 => "->".to_string(), // RETROACHIEVEMENTS (opens new screen)
+            #[cfg(target_os = "linux")]
+            10 => "->".to_string(), // AUDIO SETTINGS
+            #[cfg(not(target_os = "linux"))]
+            7 => if config.autoboot { "ON" } else { "OFF" }.to_string(), // AUTOBOOT
+            #[cfg(not(target_os = "linux"))]
+            8 => "->".to_string(), // RETROACHIEVEMENTS (opens new screen)
+            #[cfg(not(target_os = "linux"))]
+            9 => "->".to_string(), // AUDIO SETTINGS
             _ => "".to_string(),
         },
         // AUDIO SETTINGS
@@ -513,6 +540,7 @@ pub fn update(
                     }
                 }
             },
+            #[cfg(target_os = "linux")]
             7 => { // BLUETOOTH
                 if input_state.left || input_state.right {
                     config.bluetooth = !config.bluetooth;
@@ -550,6 +578,15 @@ pub fn update(
                     }
                 }
             },
+            #[cfg(not(target_os = "linux"))]
+            7 => { // AUTOBOOT (shifted from 8 on Linux)
+                if input_state.left || input_state.right {
+                    config.autoboot = !config.autoboot;
+                    config.save();
+                    sound_effects.play_cursor_move(&config);
+                }
+            },
+            #[cfg(target_os = "linux")]
             8 => { // AUTOBOOT
                 if input_state.left || input_state.right {
                     config.autoboot = !config.autoboot;
@@ -557,6 +594,31 @@ pub fn update(
                     sound_effects.play_cursor_move(&config);
                 }
             },
+            #[cfg(target_os = "linux")]
+            9 => { // RETROACHIEVEMENTS
+                if input_state.select {
+                    *current_screen = Screen::RetroAchievements;
+                    *settings_menu_selection = 0;
+                    sound_effects.play_select(&config);
+                }
+            },
+            #[cfg(target_os = "linux")]
+            10 => { // GO TO AUDIO SETTINGS
+                if input_state.select {
+                    *current_screen = Screen::AudioSettings;
+                    *settings_menu_selection = 0;
+                    sound_effects.play_select(&config);
+                }
+            },
+            #[cfg(not(target_os = "linux"))]
+            8 => { // RETROACHIEVEMENTS
+                if input_state.select {
+                    *current_screen = Screen::RetroAchievements;
+                    *settings_menu_selection = 0;
+                    sound_effects.play_select(&config);
+                }
+            },
+            #[cfg(not(target_os = "linux"))]
             9 => { // GO TO AUDIO SETTINGS
                 if input_state.select {
                     *current_screen = Screen::AudioSettings;

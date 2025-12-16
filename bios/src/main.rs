@@ -3,7 +3,7 @@ use crate::{
     audio::{AUDIO, load_sound_from_bytes, SoundEffects, play_new_bgm},
     cd_player_backend::CdPlayerBackend,
     config::{Config, get_user_data_dir},
-    dialog::Dialog,
+    dialog::{self, Dialog},
     gcc_adapter::start_gcc_adapter_polling,
     input::InputState,
     save::StorageMediaState,
@@ -16,6 +16,7 @@ use crate::{
     ui::theme_downloader::ThemeDownloaderState,
     ui::update_checker::UpdateCheckerState,
     ui::wifi::WifiState,
+    ui::retroachievements::RASettingsState,
     utils::*, // Wildcard to get all utility functions
 };
 use gilrs::Gilrs;
@@ -559,6 +560,9 @@ async fn main() {
     //let mut wifi_state = WifiState::new().expect("Wi-Fi initialization failed. Ensure wlan0 is available.");
     let mut wifi_state = WifiState::new();
 
+    // RETROACHIEVEMENTS
+    let mut ra_settings_state = RASettingsState::new();
+
     // THEME DOWNLOADER
     let mut theme_downloader_state = ThemeDownloaderState::new();
 
@@ -566,6 +570,7 @@ async fn main() {
     let mut runtime_downloader_state = RuntimeDownloaderState::new();
 
     // BLUETOOTH CONTROLLER PAIRING
+    #[cfg(target_os = "linux")]
     let mut bluetooth_state = ui::bluetooth::BluetoothState::new();
 
     // UPDATE CHECKER
@@ -750,6 +755,15 @@ async fn main() {
     let mut input_state = InputState::new();
     let mut animation_state = AnimationState::new();
 
+    // Start overlay daemon so it can be triggered from BIOS
+    println!("[BIOS] Starting overlay daemon...");
+    if let Err(e) = crate::utils::start_overlay_daemon() {
+        eprintln!("[BIOS] Warning: Failed to start overlay daemon: {}", e);
+        eprintln!("[BIOS] Overlay will still be available when games launch");
+    } else {
+        println!("[BIOS] Overlay daemon started - press F12, Ctrl+O, or Guide button to open overlay");
+    }
+
     // SPLASH SCREEN
     if config.show_splash_screen {
         // Mute BGM
@@ -867,6 +881,12 @@ async fn main() {
     let mut play_option_enabled: bool = false;
     let mut copy_logs_option_enabled = false; // new button to copy session logs over to SD card
 
+    // mGBA game launch options state
+    let mut mgba_launch_step = GameLaunchStep::SelectPlayerCount;
+    let mut mgba_launch_options = GameLaunchOptions::default();
+    let mut mgba_launch_dialog: Option<dialog::Dialog> = None;
+    let mut mgba_pending_game: Option<(save::CartInfo, PathBuf)> = None;
+
     // GCC ADAPTER
     let mut app_state = AppState {
         gcc_adapter_poll_rate: None,
@@ -971,6 +991,23 @@ async fn main() {
         input_state.reset();
         input_state.update_keyboard();
         input_state.update_controller(&mut gilrs);
+
+        // Check for overlay hotkey (Guide button or F12/Ctrl+O)
+        // Overlay daemon is started with BIOS, so overlay can be triggered from BIOS
+        if input_state.overlay_hotkey {
+            println!("[BIOS] Overlay hotkey detected!");
+            use crate::utils::{is_overlay_available, show_overlay};
+            use kazeta_overlay::OverlayScreen;
+            if is_overlay_available() {
+                show_overlay(OverlayScreen::Main);
+                println!("[BIOS] Overlay hotkey pressed - showing overlay");
+            } else {
+                println!("[BIOS] Overlay hotkey pressed but daemon is not available");
+                if DEV_MODE {
+                    println!("[BIOS] Try building the overlay: cd overlay && cargo build --bin kazeta-overlay --features daemon");
+                }
+            }
+        }
 
         // Update animations
         animation_state.update_shake(get_frame_time());
@@ -1226,8 +1263,60 @@ async fn main() {
                     if let Some((cart_info, kzi_path)) = available_games.get(game_selection) {
                         sound_effects.play_select(&config);
 
-                        if DEV_MODE {
-                            // --- DEBUG MODE ---
+                        println!("[Debug] Game selected - runtime: {:?}", cart_info.runtime);
+                        println!("[Debug] Runtime check: {:?} == Some(\"mgba\") = {}",
+                            cart_info.runtime.as_deref(),
+                            cart_info.runtime.as_deref() == Some("mgba")
+                        );
+
+                        // Check if this is an mGBA game - show launch options dialog
+                        if cart_info.runtime.as_deref() == Some("mgba") {
+                            println!("[Debug] mGBA game detected!");
+                            println!("[Debug] multiplayer_support: {:?}", cart_info.multiplayer_support);
+                            println!("[Debug] max_players: {:?}", cart_info.max_players);
+
+                            // Store the pending game info
+                            mgba_pending_game = Some((cart_info.clone(), kzi_path.clone()));
+
+                            // Reset launch options
+                            mgba_launch_options = GameLaunchOptions::default();
+                            mgba_launch_options.player_count = 1;
+                            mgba_launch_options.save_slots.clear();
+
+                            // Determine max players (default 4 if multiplayer supported, else 1)
+                            let max_players = if cart_info.multiplayer_support == Some(true) {
+                                cart_info.max_players.unwrap_or(4)
+                            } else {
+                                1
+                            };
+
+                            println!("[Debug] Calculated max_players: {}", max_players);
+
+                            if max_players > 1 {
+                                println!("[Debug] Showing player count dialog");
+                                // Show player count selection first
+                                mgba_launch_step = GameLaunchStep::SelectPlayerCount;
+                                mgba_launch_dialog = Some(dialog::create_player_count_dialog(max_players));
+                            } else {
+                                println!("[Debug] Single player - showing save slot dialog");
+                                // Single player only - go straight to save selection
+                                mgba_launch_step = GameLaunchStep::SelectSaveSlot { player: 1 };
+
+                                // Find existing save files
+                                let save_dir = save::get_mgba_save_dir(&cart_info.id);
+                                let rom_name = save::get_rom_name_from_exec(&cart_info.exec);
+                                let existing_saves = dialog::find_existing_save_slots(&save_dir, &rom_name);
+
+                                mgba_launch_dialog = Some(dialog::create_save_slot_dialog(
+                                    &existing_saves,
+                                    1,
+                                    cart_info.name.as_deref().unwrap_or(&cart_info.id)
+                                ));
+                            }
+
+                            current_screen = Screen::GameLaunchOptions;
+                        } else if DEV_MODE {
+                            // --- DEBUG MODE (non-mGBA) ---
                             log_messages.lock().unwrap().clear();
                             { // Scoped lock to add messages
                                 let mut logs = log_messages.lock().unwrap();
@@ -1245,6 +1334,11 @@ async fn main() {
                             println!("[Debug]   Runtime: {}", cart_info.runtime.as_deref().unwrap_or("None"));
                             println!("[Debug]   KZI Path: {}", kzi_path.display());
 
+                            // Start overlay daemon before launching game
+                            if let Err(e) = crate::utils::start_overlay_daemon() {
+                                log_messages.lock().unwrap().push(format!("[WARNING] Failed to start overlay daemon: {}", e));
+                            }
+
                             match save::launch_game(&cart_info, &kzi_path) {
                                 Ok(mut child) => {
                                     log_messages.lock().unwrap().push("\n--- LAUNCHING GAME ---".to_string());
@@ -1257,7 +1351,7 @@ async fn main() {
                             }
                             current_screen = Screen::Debug;
                         } else {
-                            // Instead of just restarting, we now trigger a specific game launch.
+                            // --- PRODUCTION MODE (non-mGBA) ---
                             (current_screen, fade_start_time) = trigger_game_launch(
                                 cart_info,
                                 kzi_path,
@@ -1274,6 +1368,230 @@ async fn main() {
                     &background_cache, &mut video_cache, &font_cache, &config, &mut background_state,
                     &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate, scale_factor
                 );
+            },
+            Screen::GameLaunchOptions => {
+                // mGBA game launch options dialog (multiplayer & save file selection)
+                // Use an action enum to queue changes after render
+                enum DialogAction {
+                    None,
+                    Cancel,
+                    GoBackPlayer { prev_player: u8 },
+                    GoBackToPlayerCount,
+                    SelectPlayerCount { count: u8 },
+                    SelectSaveSlot { slot: String, next_player: Option<u8> },
+                    Launch,
+                }
+
+                let mut action = DialogAction::None;
+
+                // --- Input Handling (collect action) ---
+                if let Some(ref mut dialog) = mgba_launch_dialog {
+                    if input_state.up {
+                        if dialog.selection > 0 {
+                            dialog.selection -= 1;
+                            sound_effects.play_cursor_move(&config);
+                        }
+                    }
+                    if input_state.down {
+                        if dialog.selection < dialog.options.len() - 1 {
+                            dialog.selection += 1;
+                            sound_effects.play_cursor_move(&config);
+                        }
+                    }
+                    if input_state.back {
+                        sound_effects.play_back(&config);
+                        match &mgba_launch_step {
+                            GameLaunchStep::SelectPlayerCount => {
+                                action = DialogAction::Cancel;
+                            }
+                            GameLaunchStep::SelectSaveSlot { player } => {
+                                if *player > 1 {
+                                    action = DialogAction::GoBackPlayer { prev_player: player - 1 };
+                                } else if mgba_launch_options.player_count > 1 {
+                                    action = DialogAction::GoBackToPlayerCount;
+                                } else {
+                                    action = DialogAction::Cancel;
+                                }
+                            }
+                            GameLaunchStep::Launching => {}
+                        }
+                    }
+                    if input_state.select {
+                        let selected_value = dialog.options[dialog.selection].value.clone();
+                        if selected_value == "CANCEL" {
+                            action = DialogAction::Cancel;
+                            sound_effects.play_back(&config);
+                        } else {
+                            sound_effects.play_select(&config);
+                            match &mgba_launch_step {
+                                GameLaunchStep::SelectPlayerCount => {
+                                    if let Ok(count) = selected_value.parse::<u8>() {
+                                        action = DialogAction::SelectPlayerCount { count };
+                                    }
+                                }
+                                GameLaunchStep::SelectSaveSlot { player } => {
+                                    if *player < mgba_launch_options.player_count {
+                                        action = DialogAction::SelectSaveSlot {
+                                            slot: selected_value,
+                                            next_player: Some(player + 1),
+                                        };
+                                    } else {
+                                        action = DialogAction::SelectSaveSlot {
+                                            slot: selected_value,
+                                            next_player: None,
+                                        };
+                                    }
+                                }
+                                GameLaunchStep::Launching => {}
+                            }
+                        }
+                    }
+                }
+
+                // --- Render ---
+                render_game_selection_menu(
+                    &available_games, &game_icon_cache, &placeholder, game_selection, &animation_state, &logo_cache,
+                    &background_cache, &mut video_cache, &font_cache, &config, &mut background_state,
+                    &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate, scale_factor
+                );
+
+                if let Some(ref dialog) = mgba_launch_dialog {
+                    render_mgba_launch_dialog(
+                        dialog,
+                        &font_cache,
+                        &config,
+                        scale_factor,
+                        &animation_state,
+                    );
+                }
+
+                // --- Apply action after render ---
+                match action {
+                    DialogAction::None => {}
+                    DialogAction::Cancel => {
+                        current_screen = Screen::GameSelection;
+                        mgba_pending_game = None;
+                        mgba_launch_dialog = None;
+                    }
+                    DialogAction::GoBackPlayer { prev_player } => {
+                        mgba_launch_options.save_slots.pop();
+                        mgba_launch_step = GameLaunchStep::SelectSaveSlot { player: prev_player };
+                        if let Some((cart_info, _)) = &mgba_pending_game {
+                            let save_dir = save::get_mgba_save_dir(&cart_info.id);
+                            let rom_name = save::get_rom_name_from_exec(&cart_info.exec);
+                            let existing_saves = dialog::find_existing_save_slots(&save_dir, &rom_name);
+                            mgba_launch_dialog = Some(dialog::create_save_slot_dialog(
+                                &existing_saves,
+                                prev_player,
+                                cart_info.name.as_deref().unwrap_or(&cart_info.id)
+                            ));
+                        }
+                    }
+                    DialogAction::GoBackToPlayerCount => {
+                        mgba_launch_step = GameLaunchStep::SelectPlayerCount;
+                        if let Some((cart_info, _)) = &mgba_pending_game {
+                            let max_players = cart_info.max_players.unwrap_or(4);
+                            mgba_launch_dialog = Some(dialog::create_player_count_dialog(max_players));
+                        }
+                    }
+                    DialogAction::SelectPlayerCount { count } => {
+                        mgba_launch_options.player_count = count;
+                        mgba_launch_step = GameLaunchStep::SelectSaveSlot { player: 1 };
+                        if let Some((cart_info, _)) = &mgba_pending_game {
+                            let save_dir = save::get_mgba_save_dir(&cart_info.id);
+                            let rom_name = save::get_rom_name_from_exec(&cart_info.exec);
+                            let existing_saves = dialog::find_existing_save_slots(&save_dir, &rom_name);
+                            mgba_launch_dialog = Some(dialog::create_save_slot_dialog(
+                                &existing_saves,
+                                1,
+                                cart_info.name.as_deref().unwrap_or(&cart_info.id)
+                            ));
+                        }
+                    }
+                    DialogAction::SelectSaveSlot { ref slot, next_player } => {
+                        mgba_launch_options.save_slots.push(slot.clone());
+                        if let Some(next_p) = next_player {
+                            mgba_launch_step = GameLaunchStep::SelectSaveSlot { player: next_p };
+                            if let Some((cart_info, _)) = &mgba_pending_game {
+                                let save_dir = save::get_mgba_save_dir(&cart_info.id);
+                                let rom_name = save::get_rom_name_from_exec(&cart_info.exec);
+                                let existing_saves = dialog::find_existing_save_slots(&save_dir, &rom_name);
+                                mgba_launch_dialog = Some(dialog::create_save_slot_dialog(
+                                    &existing_saves,
+                                    next_p,
+                                    cart_info.name.as_deref().unwrap_or(&cart_info.id)
+                                ));
+                            }
+                        }
+                    }
+                    DialogAction::Launch => {}
+                }
+
+                // Handle launch: check if we just selected the last save slot
+                let should_launch = matches!(&action, DialogAction::SelectSaveSlot { next_player: None, .. });
+                if should_launch {
+                    mgba_launch_step = GameLaunchStep::Launching;
+                    if let Some((cart_info, kzi_path)) = mgba_pending_game.take() {
+                        let launch_opts = save::MgbaLaunchOptions {
+                            player_count: mgba_launch_options.player_count,
+                            save_slots: mgba_launch_options.save_slots.clone(),
+                        };
+
+                        println!("[Debug] Launching mGBA game with options:");
+                        println!("[Debug]   Player count: {}", launch_opts.player_count);
+                        println!("[Debug]   Save slots: {:?}", launch_opts.save_slots);
+
+                        if DEV_MODE {
+                            log_messages.lock().unwrap().clear();
+                            {
+                                let mut logs = log_messages.lock().unwrap();
+                                logs.push("--- mGBA LAUNCH ---".to_string());
+                                logs.push(format!("Name: {}", cart_info.name.as_deref().unwrap_or("N/A")));
+                                logs.push(format!("Players: {}", launch_opts.player_count));
+                                logs.push(format!("Save slots: {:?}", launch_opts.save_slots));
+                            }
+
+                            // Start overlay daemon before launching game
+                            if let Err(e) = crate::utils::start_overlay_daemon() {
+                                log_messages.lock().unwrap().push(format!("[WARNING] Failed to start overlay daemon: {}", e));
+                            }
+
+                            match save::launch_game_with_options(&cart_info, &kzi_path, Some(&launch_opts)) {
+                                Ok(mut child) => {
+                                    log_messages.lock().unwrap().push("\n--- LAUNCHING GAME ---".to_string());
+                                    start_log_reader(&mut child, log_messages.clone());
+                                    game_process = Some(child);
+                                }
+                                Err(e) => {
+                                    log_messages.lock().unwrap().push(format!("\n--- LAUNCH FAILED ---\nError: {}", e));
+                                }
+                            }
+                            current_screen = Screen::Debug;
+                        } else {
+                            // Production mode
+                            std::env::set_var("MGBA_PLAYERS", launch_opts.player_count.to_string());
+                            if launch_opts.player_count > 1 {
+                                std::env::set_var("MGBA_MULTIPLAYER", "true");
+                                std::env::set_var("MGBA_SAVE_SLOTS", launch_opts.save_slots.join(","));
+                            } else if !launch_opts.save_slots.is_empty() {
+                                std::env::set_var("MGBA_SAVE_SLOT", &launch_opts.save_slots[0]);
+                            }
+
+                            (current_screen, fade_start_time) = trigger_game_launch(
+                                &cart_info,
+                                &kzi_path,
+                                &mut current_bgm,
+                                &music_cache
+                            );
+                        }
+                    }
+                    mgba_launch_dialog = None;
+                }
+
+                // Fallback: no dialog means go back
+                if mgba_launch_dialog.is_none() && current_screen == Screen::GameLaunchOptions {
+                    current_screen = Screen::GameSelection;
+                }
             },
             Screen::Debug => {
                 // Stop the BGM
@@ -1454,6 +1772,7 @@ async fn main() {
                     scale_factor,
                 );
             }
+            #[cfg(target_os = "linux")]
             Screen::Bluetooth => {
                 ui::bluetooth::update(
                     &mut bluetooth_state,
@@ -1477,6 +1796,11 @@ async fn main() {
                     &app_state.gcc_adapter_poll_rate,
                     scale_factor,
                 );
+            }
+            #[cfg(not(target_os = "linux"))]
+            Screen::Bluetooth => {
+                // Bluetooth not supported on this platform
+                current_screen = Screen::Extras;
             }
             Screen::ThemeDownloader => {
                 ui::theme_downloader::update(
@@ -1580,6 +1904,30 @@ async fn main() {
                     &font_cache,
                     &config,
                     &mut background_state,
+                    scale_factor,
+                );
+            }
+            Screen::RetroAchievements => {
+                ui::retroachievements::update(
+                    &mut current_screen,
+                    &mut ra_settings_state,
+                    &input_state,
+                    &mut animation_state,
+                    &sound_effects,
+                    &mut config,
+                );
+                ui::retroachievements::draw(
+                    &ra_settings_state,
+                    &animation_state,
+                    &logo_cache,
+                    &background_cache,
+                    &mut video_cache,
+                    &font_cache,
+                    &config,
+                    &mut background_state,
+                    &battery_info,
+                    &current_time_str,
+                    &app_state.gcc_adapter_poll_rate,
                     scale_factor,
                 );
             }

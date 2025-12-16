@@ -9,6 +9,7 @@ use chrono::Local;
 use crate::{save, Child, Arc, Mutex, thread, BufReader};
 use crate::audio::play_new_bgm;
 use crate::types::Screen;
+use kazeta_overlay::{OverlayClient, OverlayScreen, ToastStyle};
 //use macroquad::audio::Sound;
 
 // wrap text in certain menus so it doesn't clip outside the screen
@@ -124,6 +125,12 @@ pub fn trigger_game_launch(
     current_bgm: &mut Option<Sink>,
     music_cache: &HashMap<String, SamplesBuffer>,
 ) -> (Screen, Option<f64>) {
+    // Start the overlay daemon before launching the game
+    if let Err(e) = start_overlay_daemon() {
+        eprintln!("[WARNING] Failed to start overlay daemon: {}", e);
+        // Don't fail the launch if overlay fails to start
+    }
+
     // Write the specific launch command for the selected game
     if let Err(e) = save::write_launch_command(kzi_path) {
         // If we fail, we should probably show an error on the debug screen
@@ -200,5 +207,307 @@ pub fn apply_resolution(resolution_str: &str) {
             // Use the correct function name
             request_new_screen_size(w, h);
         }
+    }
+}
+
+// ===================================
+// OVERLAY FUNCTIONS
+// ===================================
+// 
+// These functions allow the BIOS to communicate with the overlay daemon.
+// The overlay daemon must be running (started when a game launches) for these to work.
+//
+// Example usage:
+//   - Show overlay from a menu option:
+//       use crate::utils::show_overlay;
+//       use kazeta_overlay::OverlayScreen;
+//       show_overlay(OverlayScreen::Main);
+//
+//   - Show a toast notification:
+//       use crate::utils::{show_info_toast, show_success_toast};
+//       show_info_toast("Game launched successfully!");
+//
+//   - Unlock an achievement:
+//       use crate::utils::unlock_achievement;
+//       unlock_achievement("pokemon-emerald", "catch_first_pokemon");
+//
+//   - Check if overlay is available before using:
+//       use crate::utils::{is_overlay_available, show_overlay};
+//       use kazeta_overlay::OverlayScreen;
+//       if is_overlay_available() {
+//           show_overlay(OverlayScreen::Settings);
+//       }
+
+/// Start the overlay daemon as a background process
+pub fn start_overlay_daemon() -> std::io::Result<()> {
+    use std::process::Stdio;
+    use std::io::Write;
+    
+    // Clean up any stale socket file first
+    let socket_path = Path::new("/tmp/kazeta-overlay.sock");
+    if socket_path.exists() {
+        // Try to connect AND send a message to verify daemon is actually responsive
+        use std::os::unix::net::UnixStream;
+        match UnixStream::connect(socket_path) {
+            Ok(mut stream) => {
+                // Set a short timeout
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+                
+                // Try to send a status query - if this succeeds, daemon is alive
+                let test_msg = r#"{"type":"get_status"}"#;
+                if stream.write_all(test_msg.as_bytes()).is_ok() {
+                    println!("[Overlay] Daemon is already running and responsive");
+                    return Ok(());
+                }
+                // Write failed - daemon not responsive
+                println!("[Overlay] Socket exists but daemon not responsive, restarting...");
+                let _ = fs::remove_file(socket_path);
+            }
+            Err(_) => {
+                // Socket exists but daemon not responding - remove stale socket
+                println!("[Overlay] Cleaning up stale socket file");
+                let _ = fs::remove_file(socket_path);
+            }
+        }
+    }
+
+    // Try to find the overlay binary
+    let overlay_bin = if crate::DEV_MODE {
+        // In dev mode, try to find it in the overlay target directory
+        let current_exe = std::env::current_exe().ok();
+        let mut possible_paths = vec![
+            PathBuf::from("../overlay/target/debug/kazeta-overlay"),
+            PathBuf::from("../../overlay/target/debug/kazeta-overlay"),
+            PathBuf::from("overlay/target/debug/kazeta-overlay"),
+        ];
+        
+        if let Some(exe_path) = current_exe.as_ref() {
+            if let Some(exe_dir) = exe_path.parent() {
+                possible_paths.push(exe_dir.join("../overlay/target/debug/kazeta-overlay"));
+                possible_paths.push(exe_dir.join("../../overlay/target/debug/kazeta-overlay"));
+            }
+        }
+        
+        if let Some(home) = dirs::home_dir() {
+            possible_paths.push(home.join("sandbox/kazeta-plus/overlay/target/debug/kazeta-overlay"));
+        }
+        
+        if let Ok(project_root) = std::env::var("KAZETA_PROJECT_ROOT") {
+            possible_paths.push(PathBuf::from(project_root).join("overlay/target/debug/kazeta-overlay"));
+        }
+        
+        possible_paths.iter()
+            .find(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(|| {
+                eprintln!("[Overlay] Warning: Could not find overlay binary in dev mode, trying production path");
+                PathBuf::from("/usr/bin/kazeta-overlay")
+            })
+    } else {
+        // In production, use the system binary
+        PathBuf::from("/usr/bin/kazeta-overlay")
+    };
+
+    // Check if binary exists
+    if !overlay_bin.exists() {
+        let err_msg = format!(
+            "Overlay binary not found at: {}. Please build it with: cargo build --bin kazeta-overlay --features daemon",
+            overlay_bin.display()
+        );
+        eprintln!("[Overlay] {}", err_msg);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            err_msg
+        ));
+    }
+
+    println!("[Overlay] Starting overlay daemon: {}", overlay_bin.display());
+
+    // Create a log file for overlay output (helps debug startup issues)
+    let log_path = "/tmp/kazeta-overlay.log";
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path)
+        .ok();
+
+    // Spawn the overlay daemon as a detached background process
+    let mut cmd = Command::new(&overlay_bin);
+    
+    if let Some(file) = log_file {
+        let stderr_file = file.try_clone().ok();
+        cmd.stdout(Stdio::from(file));
+        if let Some(stderr) = stderr_file {
+            cmd.stderr(Stdio::from(stderr));
+        } else {
+            cmd.stderr(Stdio::null());
+        }
+    } else {
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    }
+    
+    cmd.spawn()
+        .map_err(|e| {
+            eprintln!("[Overlay] Failed to start overlay daemon: {}", e);
+            e
+        })?;
+
+    // Give it a moment to start up (macroquad needs time to initialize window)
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    // Verify it started successfully by checking for socket
+    for attempt in 0..3 {
+        if is_overlay_available() {
+            println!("[Overlay] Daemon started successfully");
+            return Ok(());
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    
+    // Check log file for errors
+    if let Ok(log_content) = fs::read_to_string(log_path) {
+        if !log_content.is_empty() {
+            eprintln!("[Overlay] Daemon output:\n{}", log_content);
+        }
+    }
+    
+    eprintln!("[Overlay] Warning: Daemon may not have started correctly (socket not found after 2s)");
+    Ok(())  // Don't fail, overlay might work when game launches
+}
+
+/// Stop the overlay daemon (kills any running instance)
+pub fn stop_overlay_daemon() {
+    // Try to find and kill the overlay process
+    // This is a simple approach - in production you might want to use a PID file
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg("kazeta-overlay")
+        .output();
+    
+    // Also remove the socket file if it exists
+    let socket_path = Path::new("/tmp/kazeta-overlay.sock");
+    if socket_path.exists() {
+        let _ = fs::remove_file(socket_path);
+    }
+    
+    println!("[Overlay] Daemon stopped");
+}
+
+/// Check if the overlay daemon is available
+pub fn is_overlay_available() -> bool {
+    let client = OverlayClient::new();
+    client.is_available()
+}
+
+/// Show the overlay menu with a specific screen
+pub fn show_overlay(screen: OverlayScreen) {
+    let client = OverlayClient::new();
+    if client.is_available() {
+        if let Err(e) = client.show_overlay(screen) {
+            eprintln!("[Overlay] Failed to show overlay: {}", e);
+        }
+    } else {
+        eprintln!("[Overlay] Overlay daemon is not available (socket not found)");
+    }
+}
+
+/// Hide the overlay menu
+pub fn hide_overlay() {
+    let client = OverlayClient::new();
+    if client.is_available() {
+        if let Err(e) = client.hide_overlay() {
+            eprintln!("[Overlay] Failed to hide overlay: {}", e);
+        }
+    }
+}
+
+/// Show a toast notification
+pub fn show_toast(message: &str, style: ToastStyle) {
+    let client = OverlayClient::new();
+    if client.is_available() {
+        if let Err(e) = client.show_toast(message, style, 3000) {
+            eprintln!("[Overlay] Failed to show toast: {}", e);
+        }
+    }
+}
+
+/// Show an info toast
+pub fn show_info_toast(message: &str) {
+    show_toast(message, ToastStyle::Info);
+}
+
+/// Show a success toast
+pub fn show_success_toast(message: &str) {
+    show_toast(message, ToastStyle::Success);
+}
+
+/// Show a warning toast
+pub fn show_warning_toast(message: &str) {
+    show_toast(message, ToastStyle::Warning);
+}
+
+/// Show an error toast
+pub fn show_error_toast(message: &str) {
+    show_toast(message, ToastStyle::Error);
+}
+
+/// Unlock an achievement
+pub fn unlock_achievement(cart_id: &str, achievement_id: &str) {
+    let client = OverlayClient::new();
+    if client.is_available() {
+        if let Err(e) = client.unlock_achievement(cart_id, achievement_id) {
+            eprintln!("[Overlay] Failed to unlock achievement: {}", e);
+        }
+    }
+}
+
+/// Notify the overlay that a game has started
+pub fn notify_game_started(cart_id: &str, game_name: &str, runtime: &str) {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    
+    let socket_path = "/tmp/kazeta-overlay.sock";
+    if !Path::new(socket_path).exists() {
+        return;
+    }
+    
+    let message = serde_json::json!({
+        "type": "game_started",
+        "cart_id": cart_id,
+        "game_name": game_name,
+        "runtime": runtime,
+    });
+    
+    if let Ok(mut stream) = UnixStream::connect(socket_path) {
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
+        let _ = writeln!(stream, "{}", message);
+        println!("[Overlay] Notified game started: {} ({})", game_name, runtime);
+    }
+}
+
+/// Notify the overlay that a game has stopped
+pub fn notify_game_stopped(cart_id: &str) {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    
+    let socket_path = "/tmp/kazeta-overlay.sock";
+    if !Path::new(socket_path).exists() {
+        return;
+    }
+    
+    let message = serde_json::json!({
+        "type": "game_stopped",
+        "cart_id": cart_id,
+    });
+    
+    if let Ok(mut stream) = UnixStream::connect(socket_path) {
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
+        let _ = writeln!(stream, "{}", message);
+        println!("[Overlay] Notified game stopped: {}", cart_id);
     }
 }

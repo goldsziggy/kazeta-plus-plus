@@ -120,42 +120,13 @@ pub fn update(
                                     *current_screen = Screen::Debug;
                                 },
                                 1 => {
-                                    // Case: Exactly one game found, go to Debug screen and launch
-                                    let (cart_info, kzi_path) = games.remove(0);
-                                    sound_effects.play_select(&config);
+                                    // Case: Exactly one game found
+                                    *available_games = games;
+                                    *game_selection = 0;
 
-                                    if DEV_MODE {
-                                        { // Scoped lock to add messages
-                                            let mut logs = log_messages.lock().unwrap();
-                                            logs.push("--- CARTRIDGE FOUND ---".to_string());
-                                            logs.push(format!("Name: {}", cart_info.name.as_deref().unwrap_or("N/A")));
-                                            logs.push(format!("ID: {}", cart_info.id));
-                                            logs.push(format!("Exec: {}", cart_info.exec));
-                                            logs.push(format!("Runtime: {}", cart_info.runtime.as_deref().unwrap_or("None")));
-                                            logs.push(format!("KZI Path: {}", kzi_path.display()));
-                                        }
-                                        println!("[Debug] Single Cartridge Found! Preparing to launch...");
-                                        println!("[Debug]   Name: {}", cart_info.name.as_deref().unwrap_or("N/A"));
-                                        println!("[Debug]   ID: {}", cart_info.id);
-                                        println!("[Debug]   Exec: {}", cart_info.exec);
-                                        println!("[Debug]   Runtime: {}", cart_info.runtime.as_deref().unwrap_or("None"));
-                                        println!("[Debug]   KZI Path: {}", kzi_path.display());
-
-                                        match save::launch_game(&cart_info, &kzi_path) {
-                                            Ok(mut child) => {
-                                                log_messages.lock().unwrap().push("\n--- LAUNCHING GAME ---".to_string());
-                                                start_log_reader(&mut child, log_messages.clone());
-                                                *game_process = Some(child);
-                                            }
-                                            Err(e) => {
-                                                log_messages.lock().unwrap().push(format!("\n--- LAUNCH FAILED ---\nError: {}", e));
-                                            }
-                                        }
-                                        *current_screen = Screen::Debug;
-                                    } else {
-                                        // --- PRODUCTION MODE: Fade out and launch ---
-                                        (*current_screen, *fade_start_time) = trigger_session_restart(current_bgm, &music_cache);
-                                    }
+                                    // Trigger the same launch flow as GameSelection screen
+                                    // This will show multiplayer prompts for mGBA games
+                                    *current_screen = Screen::GameSelection;
                                 },
                                 _ => { // multiple games found
                                     println!("[Debug] Found {} games. Switching to selection screen.", games.len());

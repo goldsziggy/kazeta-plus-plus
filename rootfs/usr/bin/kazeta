@@ -216,6 +216,8 @@ post_exec_cmd=$(get_attribute 'PostExec' ${cart_info})
 # or it will be "some_command;"
 trap "\
 	if [ -n \"\$PLAYTIME_PID\" ]; then kill \"\$PLAYTIME_PID\" 2>/dev/null; fi; \
+	if [ -n \"\$OVERLAY_PID\" ]; then kill \"\$OVERLAY_PID\" 2>/dev/null; fi; \
+	rm -f /tmp/kazeta-quit-game; \
 	popd; \
 	echo 'DEBUG: Running PostExec cleanup...'; \
 	${post_exec_cmd} \
@@ -258,6 +260,23 @@ mkdir -p .kazeta/var
 date --iso-8601=seconds > .kazeta/var/playtime_start
 start_playtime_capture &
 PLAYTIME_PID=$! # save PID of background job
+
+# --- Start Overlay Daemon ---
+# Check if overlay daemon is already running
+if [ ! -S /tmp/kazeta-overlay.sock ]; then
+    echo "DEBUG: Starting overlay daemon..."
+    if command -v kazeta-overlay &> /dev/null; then
+        kazeta-overlay > /dev/null 2>&1 &
+        OVERLAY_PID=$!
+        echo "DEBUG: Overlay daemon started (PID: $OVERLAY_PID)"
+        # Give it a moment to initialize
+        sleep 0.5
+    else
+        echo "DEBUG: Warning: kazeta-overlay binary not found, overlay will not be available"
+    fi
+else
+    echo "DEBUG: Overlay daemon already running"
+fi
 
 # --- EXECUTION & ERROR HANDLING ---
 

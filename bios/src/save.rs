@@ -11,6 +11,7 @@ use std::{
 };
 use sysinfo::Disks;
 use tar::{Builder, Archive};
+use flate2::read::GzDecoder;
 
 use crate::{
     DEV_MODE,
@@ -44,6 +45,10 @@ pub struct CartInfo {
     pub exec: String,
     pub icon: String,
     pub runtime: Option<String>, // runtime is optional
+    // Multiplayer metadata (for mGBA and other emulators)
+    pub multiplayer_support: Option<bool>,
+    pub max_players: Option<u8>,
+    pub multiplayer_type: Option<String>, // "link-cable", "wireless", "both"
 }
 
 #[derive(Clone, Debug)]
@@ -423,12 +428,28 @@ pub fn write_launch_command(kzi_path: &Path) -> std::io::Result<()> {
 // [UPDATED] Searches for both kzi and kzp
 pub fn find_all_game_files() -> Result<(Vec<PathBuf>, Vec<String>), SaveError> {
     let mut debug_log = Vec::new();
-    let mount_dir = "/run/media/";
+
+    // Check for development games directory first (for macOS/dev testing)
+    // Only check in dev mode
+    let dev_games_dir = if DEV_MODE {
+        dirs::home_dir()
+            .map(|h| h.join("kazeta-games"))
+            .filter(|p| p.exists())
+    } else {
+        None
+    };
+
+    let mount_dir = if let Some(dev_dir) = dev_games_dir {
+        debug_log.push(format!("[Debug] Using development games directory: {}", dev_dir.display()));
+        dev_dir.to_string_lossy().to_string()
+    } else {
+        "/run/media/".to_string()
+    };
 
     debug_log.push(format!("[Debug] Searching for .kzi and .kzp files in '{}' (max depth: 2)...", mount_dir));
 
     // Search for both extensions
-    match find_files_by_extension(mount_dir, &["kzi", "kzp"], 2, false) {
+    match find_files_by_extension(&mount_dir, &["kzi", "kzp"], 2, false) {
         Ok(files) => {
             debug_log.push(format!("[Debug] Found {} potential game file(s).", files.len()));
             for (i, path) in files.iter().enumerate() {
@@ -446,38 +467,88 @@ pub fn find_all_game_files() -> Result<(Vec<PathBuf>, Vec<String>), SaveError> {
 
 /// Parses a specific .kzi file and returns its metadata.
 pub fn parse_kzi_file(kzi_path: &Path) -> Result<CartInfo, SaveError> {
-    let content = fs::read_to_string(kzi_path)?;
+    // Open the .kzi file (which is a gzip-compressed tar archive)
+    let file = fs::File::open(kzi_path)?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
 
-    let mut name = None;
-    let mut id = None;
-    let mut exec = None;
-    let mut icon = None;
-    let mut runtime = None;
+    // Find and read the cartridge.toml file from the archive
+    let mut content = String::new();
+    let mut found_toml = false;
 
-    for line in content.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            match key.trim() {
-                "Name" => name = Some(value.trim().to_string()),
-                "Id" => id = Some(value.trim().to_string()),
-                "Exec" => exec = Some(value.trim().to_string()),
-                "Icon" => icon = Some(value.trim().to_string()),
-                "Runtime" => runtime = Some(value.trim().to_string()),
-                _ => {}
-            }
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+
+        if path.file_name().and_then(|n| n.to_str()) == Some("cartridge.toml") {
+            entry.read_to_string(&mut content)?;
+            found_toml = true;
+            break;
         }
     }
 
-    if let (Some(id), Some(exec), Some(icon)) = (id, exec, icon) {
-        Ok(CartInfo { name, id, exec, icon, runtime })
-    } else {
-        Err(SaveError::Message(format!("Invalid .kzi file: '{}'. Missing required fields.", kzi_path.display())))
+    if !found_toml {
+        return Err(SaveError::Message(format!(
+            "No cartridge.toml found in .kzi file: '{}'",
+            kzi_path.display()
+        )));
     }
+
+    // Parse the TOML content
+    let toml_value: toml::Value = toml::from_str(&content)
+        .map_err(|e| SaveError::Message(format!("Failed to parse cartridge.toml: {}", e)))?;
+
+    // Extract fields from TOML
+    let name = toml_value.get("name").and_then(|v| v.as_str()).map(String::from);
+    let id = toml_value.get("id").and_then(|v| v.as_str()).map(String::from);
+    let exec = toml_value.get("exec").and_then(|v| v.as_str()).map(String::from);
+    let icon = toml_value.get("icon").and_then(|v| v.as_str()).map(String::from)
+        .or_else(|| Some("default.png".to_string())); // Default icon if not specified
+    let runtime = toml_value.get("runtime").and_then(|v| v.as_str()).map(String::from);
+    let multiplayer_support = toml_value.get("multiplayer_support").and_then(|v| v.as_bool());
+    let max_players = toml_value.get("max_players").and_then(|v| v.as_integer()).map(|n| n as u8);
+    let multiplayer_type = toml_value.get("multiplayer_type").and_then(|v| v.as_str()).map(String::from);
+
+    if let (Some(id), Some(exec), Some(icon)) = (id, exec, icon) {
+        Ok(CartInfo {
+            name,
+            id,
+            exec,
+            icon,
+            runtime,
+            multiplayer_support,
+            max_players,
+            multiplayer_type,
+        })
+    } else {
+        Err(SaveError::Message(format!(
+            "Invalid cartridge.toml in '{}'. Missing required fields (id, exec, or icon).",
+            kzi_path.display()
+        )))
+    }
+}
+
+/// Options for launching an mGBA game with multiplayer and save slot selection
+#[derive(Clone, Debug, Default)]
+pub struct MgbaLaunchOptions {
+    pub player_count: u8,           // 1-4 players
+    pub save_slots: Vec<String>,    // Save slot for each player (e.g., ["p1", "p2"])
 }
 
 // for debug game launch
 // [UPDATED] Added logic to handle .kzp files by invoking the wrapper script directly
+// [UPDATED] Added multiplayer support with environment variables for mGBA and other emulators
 pub fn launch_game(cart_info: &CartInfo, kzi_path: &Path) -> std::io::Result<Child> {
+    // Default to single player with default save slot
+    launch_game_with_options(cart_info, kzi_path, None)
+}
 
+/// Launch a game with optional mGBA-specific options (player count, save slots)
+pub fn launch_game_with_options(
+    cart_info: &CartInfo,
+    kzi_path: &Path,
+    mgba_options: Option<&MgbaLaunchOptions>,
+) -> std::io::Result<Child> {
     // Check if this is a compressed package (.kzp)
     if kzi_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("kzp")) {
         println!("[Debug] Launching compressed package directly via kazeta wrapper: {}", kzi_path.display());
@@ -487,6 +558,40 @@ pub fn launch_game(cart_info: &CartInfo, kzi_path: &Path) -> std::io::Result<Chi
         let mut command = Command::new("/usr/bin/kazeta");
         command.arg(kzi_path);
 
+        // Set multiplayer environment variables based on options or cart_info
+        if let Some(opts) = mgba_options {
+            if opts.player_count > 1 {
+                command.env("MGBA_MULTIPLAYER", "true");
+                command.env("MGBA_PLAYERS", opts.player_count.to_string());
+                // Pass save slots as comma-separated list
+                command.env("MGBA_SAVE_SLOTS", opts.save_slots.join(","));
+                println!("[Debug] Multiplayer enabled - {} players, slots: {:?}", opts.player_count, opts.save_slots);
+            } else {
+                // Single player with selected save slot
+                if !opts.save_slots.is_empty() {
+                    command.env("MGBA_SAVE_SLOT", &opts.save_slots[0]);
+                    println!("[Debug] Single player with save slot: {}", opts.save_slots[0]);
+                }
+            }
+            if let Some(max_players) = cart_info.max_players {
+                command.env("MGBA_MAX_PLAYERS", max_players.to_string());
+            }
+            if let Some(ref mp_type) = cart_info.multiplayer_type {
+                command.env("MGBA_MULTIPLAYER_TYPE", mp_type);
+            }
+        } else if let Some(true) = cart_info.multiplayer_support {
+            // Legacy behavior: default to 2 players if no options provided
+            command.env("MGBA_MULTIPLAYER", "true");
+            if let Some(max_players) = cart_info.max_players {
+                command.env("MGBA_MAX_PLAYERS", max_players.to_string());
+            }
+            if let Some(ref mp_type) = cart_info.multiplayer_type {
+                command.env("MGBA_MULTIPLAYER_TYPE", mp_type);
+            }
+            command.env("MGBA_PLAYERS", "2");
+            println!("[Debug] Multiplayer enabled - defaulting to 2 players");
+        }
+
         return command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -494,10 +599,359 @@ pub fn launch_game(cart_info: &CartInfo, kzi_path: &Path) -> std::io::Result<Chi
     }
 
     // --- Standard Folder-Based Launch Logic (.kzi) ---
-    let game_root = kzi_path.parent().unwrap();
+    // For .kzi files, we need to extract them to a temporary location first
+    let extract_dir = if DEV_MODE {
+        // In dev mode, use a cache directory to avoid re-extracting every time
+        get_user_data_dir().unwrap().join("kzi-cache").join(&cart_info.id)
+    } else {
+        // In production, extract to /tmp
+        PathBuf::from("/tmp").join("kazeta-kzi").join(&cart_info.id)
+    };
+
+    // Extract the .kzi if it hasn't been extracted yet or if it's newer than the cache
+    let needs_extraction = !extract_dir.exists() ||
+        fs::metadata(kzi_path).and_then(|kzi_meta|
+            fs::metadata(&extract_dir).map(|cache_meta|
+                kzi_meta.modified().unwrap() > cache_meta.modified().unwrap()
+            )
+        ).unwrap_or(true);
+
+    if needs_extraction {
+        println!("[Debug] Extracting .kzi to: {}", extract_dir.display());
+        fs::create_dir_all(&extract_dir)?;
+
+        let file = fs::File::open(kzi_path)?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = Archive::new(decoder);
+        archive.unpack(&extract_dir)?;
+
+        println!("[Debug] Extraction complete");
+    } else {
+        println!("[Debug] Using cached extraction at: {}", extract_dir.display());
+    }
+
+    let game_root = extract_dir;
+
+    // Check for embedded save files and copy them to the save directory
+    // Save files can be included in the .kzi archive for distribution
+    // Use "internal" as the drive name for dev mode, or get it from the KZI path
+    let drive_name = if DEV_MODE { "internal" } else { "internal" }; // TODO: detect actual drive
+    let save_dir = PathBuf::from(get_save_dir_from_drive_name(drive_name)).join(&cart_info.id);
+    fs::create_dir_all(&save_dir)?;
+
+    // Use a marker file to track if saves have been imported from this .kzi
+    // This prevents re-importing even if the user deletes their save file
+    let import_marker = save_dir.join(".saves-imported");
+    let should_import_saves = !import_marker.exists();
+
+    if should_import_saves {
+        // Look for .sav files in the extracted game root
+        if let Ok(entries) = fs::read_dir(&game_root) {
+            let mut copied_saves = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("sav") {
+                    let save_name = path.file_name().unwrap();
+                    let dest_path = save_dir.join(save_name);
+
+                    // Only copy if the save doesn't already exist (don't overwrite user saves)
+                    if !dest_path.exists() {
+                        match fs::copy(&path, &dest_path) {
+                            Ok(_) => {
+                                println!("[Debug] Copied embedded save file: {}", save_name.to_string_lossy());
+                                copied_saves.push(save_name.to_string_lossy().to_string());
+                            }
+                            Err(e) => {
+                                eprintln!("[Warning] Failed to copy save file {}: {}", save_name.to_string_lossy(), e);
+                            }
+                        }
+                    } else {
+                        println!("[Debug] Save file already exists, skipping: {}", save_name.to_string_lossy());
+                    }
+                }
+            }
+
+            if !copied_saves.is_empty() {
+                println!("[Info] Imported {} embedded save file(s): {}", copied_saves.len(), copied_saves.join(", "));
+            }
+
+            // Create the marker file to prevent future imports
+            if let Err(e) = fs::File::create(&import_marker) {
+                eprintln!("[Warning] Failed to create import marker: {}", e);
+            }
+        }
+    } else {
+        println!("[Debug] Save files already imported (marker exists), skipping");
+    }
 
     println!("[Debug] Game Root: {}", game_root.display());
     println!("[Debug] Exec Command: {}", &cart_info.exec);
+
+    // Handle mgba runtime specially - it needs the wrapper script
+    if cart_info.runtime.as_deref() == Some("mgba") {
+        if DEV_MODE {
+            // In dev mode, look for the wrapper in the runtimes directory
+            // Try multiple possible locations
+            let current_exe = std::env::current_exe().ok();
+            let mut possible_paths = vec![
+                PathBuf::from("../runtimes/gba/mgba-run-wrapper.sh"),
+                PathBuf::from("../../runtimes/gba/mgba-run-wrapper.sh"),
+                PathBuf::from("runtimes/gba/mgba-run-wrapper.sh"),
+            ];
+            
+            // Try relative to the executable location
+            if let Some(exe_path) = current_exe.as_ref() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    possible_paths.push(exe_dir.join("../runtimes/gba/mgba-run-wrapper.sh"));
+                    possible_paths.push(exe_dir.join("../../runtimes/gba/mgba-run-wrapper.sh"));
+                }
+            }
+            
+            // Try absolute path based on common dev setup
+            if let Some(home) = dirs::home_dir() {
+                possible_paths.push(home.join("sandbox/kazeta-plus/runtimes/gba/mgba-run-wrapper.sh"));
+            }
+            
+            // Check environment variable for project root
+            if let Ok(project_root) = std::env::var("KAZETA_PROJECT_ROOT") {
+                possible_paths.push(PathBuf::from(project_root).join("runtimes/gba/mgba-run-wrapper.sh"));
+            }
+            
+            let wrapper_path = possible_paths.iter()
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| {
+                    eprintln!("[Warning] Could not find mgba-run-wrapper.sh, trying default path");
+                    PathBuf::from("runtimes/gba/mgba-run-wrapper.sh")
+                });
+
+            // Canonicalize to absolute path to avoid issues when changing working directory
+            let wrapper_path = wrapper_path.canonicalize()
+                .unwrap_or_else(|e| {
+                    eprintln!("[Warning] Failed to canonicalize wrapper path: {}", e);
+                    wrapper_path.clone()
+                });
+
+            println!("[Debug] Using wrapper script: {}", wrapper_path.display());
+
+            let rom_path = game_root.join(&cart_info.exec);
+            let mut command = Command::new("bash");
+            command.arg(&wrapper_path);
+            command.arg(&rom_path);
+            command.arg(&cart_info.id);
+
+            // Set multiplayer environment variables based on options or cart_info
+            if let Some(opts) = mgba_options {
+                if opts.player_count > 1 {
+                    command.env("MGBA_MULTIPLAYER", "true");
+                    command.env("MGBA_PLAYERS", opts.player_count.to_string());
+                    command.env("MGBA_SAVE_SLOTS", opts.save_slots.join(","));
+                    println!("[Debug] Multiplayer enabled - {} players, slots: {:?}", opts.player_count, opts.save_slots);
+                } else {
+                    // Single player with selected save slot
+                    if !opts.save_slots.is_empty() {
+                        command.env("MGBA_SAVE_SLOT", &opts.save_slots[0]);
+                        println!("[Debug] Single player with save slot: {}", opts.save_slots[0]);
+                    }
+                }
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("MGBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("MGBA_MULTIPLAYER_TYPE", mp_type);
+                }
+            } else if let Some(true) = cart_info.multiplayer_support {
+                command.env("MGBA_MULTIPLAYER", "true");
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("MGBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("MGBA_MULTIPLAYER_TYPE", mp_type);
+                }
+                command.env("MGBA_PLAYERS", "2");
+                println!("[Debug] Multiplayer enabled - defaulting to 2 players");
+            }
+
+            return command
+                .current_dir(game_root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+        } else {
+            // In production, use the kazeta wrapper script (like .kzp files)
+            // It handles mounting the runtime and calling the appropriate wrapper
+            println!("[Debug] Launching .kzi with mgba runtime via kazeta wrapper: {}", kzi_path.display());
+            
+            let mut command = Command::new("/usr/bin/kazeta");
+            command.arg(kzi_path);
+
+            // Set multiplayer environment variables based on options or cart_info
+            if let Some(opts) = mgba_options {
+                if opts.player_count > 1 {
+                    command.env("MGBA_MULTIPLAYER", "true");
+                    command.env("MGBA_PLAYERS", opts.player_count.to_string());
+                    command.env("MGBA_SAVE_SLOTS", opts.save_slots.join(","));
+                    println!("[Debug] Multiplayer enabled - {} players, slots: {:?}", opts.player_count, opts.save_slots);
+                } else {
+                    // Single player with selected save slot
+                    if !opts.save_slots.is_empty() {
+                        command.env("MGBA_SAVE_SLOT", &opts.save_slots[0]);
+                        println!("[Debug] Single player with save slot: {}", opts.save_slots[0]);
+                    }
+                }
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("MGBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("MGBA_MULTIPLAYER_TYPE", mp_type);
+                }
+            } else if let Some(true) = cart_info.multiplayer_support {
+                command.env("MGBA_MULTIPLAYER", "true");
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("MGBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("MGBA_MULTIPLAYER_TYPE", mp_type);
+                }
+                command.env("MGBA_PLAYERS", "2");
+                println!("[Debug] Multiplayer enabled - defaulting to 2 players");
+            }
+
+            return command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+        }
+    }
+
+    // Handle vba-m runtime specially - it needs the wrapper script
+    if cart_info.runtime.as_deref() == Some("vba-m") {
+        if DEV_MODE {
+            // In dev mode, look for the wrapper in the runtimes directory
+            let current_exe = std::env::current_exe().ok();
+            let mut possible_paths = vec![
+                PathBuf::from("../runtimes/gba/vba-run-wrapper.sh"),
+                PathBuf::from("../../runtimes/gba/vba-run-wrapper.sh"),
+                PathBuf::from("runtimes/gba/vba-run-wrapper.sh"),
+            ];
+
+            // Try relative to the executable location
+            if let Some(exe_path) = current_exe.as_ref() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    possible_paths.push(exe_dir.join("../runtimes/gba/vba-run-wrapper.sh"));
+                    possible_paths.push(exe_dir.join("../../runtimes/gba/vba-run-wrapper.sh"));
+                }
+            }
+
+            // Try absolute path based on common dev setup
+            if let Some(home) = dirs::home_dir() {
+                possible_paths.push(home.join("sandbox/kazeta-plus/runtimes/gba/vba-run-wrapper.sh"));
+            }
+
+            // Check environment variable for project root
+            if let Ok(project_root) = std::env::var("KAZETA_PROJECT_ROOT") {
+                possible_paths.push(PathBuf::from(project_root).join("runtimes/gba/vba-run-wrapper.sh"));
+            }
+
+            let wrapper_path = possible_paths.iter()
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| {
+                    eprintln!("[Warning] Could not find vba-run-wrapper.sh, trying default path");
+                    PathBuf::from("runtimes/gba/vba-run-wrapper.sh")
+                });
+
+            // Canonicalize to absolute path to avoid issues when changing working directory
+            let wrapper_path = wrapper_path.canonicalize()
+                .unwrap_or_else(|e| {
+                    eprintln!("[Warning] Failed to canonicalize wrapper path: {}", e);
+                    wrapper_path.clone()
+                });
+
+            println!("[Debug] Using VBA-M wrapper script: {}", wrapper_path.display());
+
+            let rom_path = game_root.join(&cart_info.exec);
+            let mut command = Command::new("bash");
+            command.arg(&wrapper_path);
+            command.arg(&rom_path);
+            command.arg(&cart_info.id);
+
+            // Set multiplayer environment variables based on options or cart_info
+            if let Some(opts) = mgba_options {
+                if opts.player_count > 1 {
+                    command.env("VBA_MULTIPLAYER", "true");
+                    command.env("VBA_PLAYERS", opts.player_count.to_string());
+                    command.env("VBA_SAVE_SLOTS", opts.save_slots.join(","));
+                    println!("[Debug] VBA-M Multiplayer enabled - {} players, slots: {:?}", opts.player_count, opts.save_slots);
+                } else {
+                    // Single player with selected save slot
+                    if !opts.save_slots.is_empty() {
+                        command.env("VBA_SAVE_SLOT", &opts.save_slots[0]);
+                        println!("[Debug] VBA-M Single player with save slot: {}", opts.save_slots[0]);
+                    }
+                }
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("VBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("VBA_MULTIPLAYER_TYPE", mp_type);
+                }
+            } else if let Some(true) = cart_info.multiplayer_support {
+                command.env("VBA_MULTIPLAYER", "true");
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("VBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("VBA_MULTIPLAYER_TYPE", mp_type);
+                }
+                command.env("VBA_PLAYERS", "2");
+                println!("[Debug] VBA-M Multiplayer enabled - defaulting to 2 players");
+            }
+
+            return command
+                .current_dir(game_root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+        } else {
+            // In production, use the kazeta wrapper script
+            println!("[Debug] Launching .kzi with vba-m runtime via kazeta wrapper: {}", kzi_path.display());
+
+            let mut command = Command::new("/usr/bin/kazeta");
+            command.arg(kzi_path);
+
+            // Set multiplayer environment variables
+            if let Some(opts) = mgba_options {
+                if opts.player_count > 1 {
+                    command.env("VBA_MULTIPLAYER", "true");
+                    command.env("VBA_PLAYERS", opts.player_count.to_string());
+                    command.env("VBA_SAVE_SLOTS", opts.save_slots.join(","));
+                } else if !opts.save_slots.is_empty() {
+                    command.env("VBA_SAVE_SLOT", &opts.save_slots[0]);
+                }
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("VBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("VBA_MULTIPLAYER_TYPE", mp_type);
+                }
+            } else if let Some(true) = cart_info.multiplayer_support {
+                command.env("VBA_MULTIPLAYER", "true");
+                if let Some(max_players) = cart_info.max_players {
+                    command.env("VBA_MAX_PLAYERS", max_players.to_string());
+                }
+                if let Some(ref mp_type) = cart_info.multiplayer_type {
+                    command.env("VBA_MULTIPLAYER_TYPE", mp_type);
+                }
+                command.env("VBA_PLAYERS", "2");
+            }
+
+            return command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+        }
+    }
 
     // Use a `match` block to create the base command
     let mut cmd = match cart_info.runtime.as_deref().unwrap_or("linux") {
@@ -513,11 +967,49 @@ pub fn launch_game(cart_info: &CartInfo, kzi_path: &Path) -> std::io::Result<Chi
         }
     };
 
+    // Set multiplayer environment variables if supported
+    if let Some(true) = cart_info.multiplayer_support {
+        cmd.env("MGBA_MULTIPLAYER", "true");
+        if let Some(max_players) = cart_info.max_players {
+            cmd.env("MGBA_MAX_PLAYERS", max_players.to_string());
+        }
+        if let Some(ref mp_type) = cart_info.multiplayer_type {
+            cmd.env("MGBA_MULTIPLAYER_TYPE", mp_type);
+        }
+
+        // Use options if provided, otherwise default to 2 players
+        if let Some(opts) = mgba_options {
+            cmd.env("MGBA_PLAYERS", opts.player_count.to_string());
+            if !opts.save_slots.is_empty() {
+                cmd.env("MGBA_SAVE_SLOTS", opts.save_slots.join(","));
+            }
+        } else {
+            cmd.env("MGBA_PLAYERS", "2");
+        }
+
+        println!("[Debug] Multiplayer enabled");
+    }
+
     // Now, apply the common settings and spawn the process
     cmd.current_dir(game_root)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()
+}
+
+/// Get the save directory path for a cart
+pub fn get_mgba_save_dir(cart_id: &str) -> PathBuf {
+    let base_dir = dirs::home_dir().unwrap().join(".local/share/kazeta/saves/default");
+    base_dir.join(cart_id)
+}
+
+/// Get the ROM name from the exec path (without extension)
+pub fn get_rom_name_from_exec(exec: &str) -> String {
+    std::path::Path::new(exec)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("game")
+        .to_string()
 }
 
 /// Searches for files with a given extension within a directory up to a specified depth
@@ -684,6 +1176,18 @@ pub fn is_cart(drive_name: &str) -> bool {
 
 // [UPDATED] Logic now checks for both kzi and kzp
 pub fn is_cart_connected() -> bool {
+    // In dev mode, check ~/kazeta-games first
+    if DEV_MODE {
+        if let Some(dev_games_dir) = dirs::home_dir().map(|h| h.join("kazeta-games")).filter(|p| p.exists()) {
+            if let Ok(files) = find_files_by_extension(&dev_games_dir, &["kzi", "kzp"], 2, true) {
+                if files.len() > 0 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check production location
     if let Ok(files) = find_files_by_extension("/run/media", &["kzi", "kzp"], 2, true) {
         if files.len() > 0 {
             return true;

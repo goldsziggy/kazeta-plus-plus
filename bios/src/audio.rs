@@ -16,8 +16,12 @@ pub struct AudioSystem {
     pub stream: OutputStream,
 }
 
-// [!] Note: If you get an error that AudioSystem cannot be shared between threads
-// (Sync trait), we may need to wrap this in a Mutex. For now, we keep it simple.
+// SAFETY: AudioSystem is only used to keep the OutputStream alive and access its mixer.
+// The OutputStream itself is never mutated after creation, and all audio operations
+// go through thread-safe Sink objects created from the mixer.
+unsafe impl Send for AudioSystem {}
+unsafe impl Sync for AudioSystem {}
+
 pub static AUDIO: Lazy<AudioSystem> = Lazy::new(|| {
     let stream = OutputStreamBuilder::open_default_stream()
     .expect("Failed to load audio stream");

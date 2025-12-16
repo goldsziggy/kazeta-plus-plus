@@ -83,6 +83,49 @@ if [ -n "${PACKAGE_OVERRIDES}" ]; then
 	cp -rv /tmp/extra_pkgs/*.pkg.tar* ${BUILD_PATH}/own_pkgs
 fi
 
+# Build Rust projects (BIOS, overlay, and RA) before entering chroot
+# This ensures the binaries are available to be copied into the image
+echo "Building Rust projects..."
+
+# Build BIOS
+echo "Building kazeta-bios..."
+cd bios
+cargo build --release
+if [ ! -f "target/release/kazeta-bios" ]; then
+    echo "ERROR: Failed to build kazeta-bios"
+    exit 1
+fi
+cd ..
+
+# Build overlay
+echo "Building kazeta-overlay..."
+cd overlay
+cargo build --release --bin kazeta-overlay --features daemon
+if [ ! -f "target/release/kazeta-overlay" ]; then
+    echo "ERROR: Failed to build kazeta-overlay"
+    exit 1
+fi
+cd ..
+
+# Build RetroAchievements CLI
+echo "Building kazeta-ra..."
+cd ra
+cargo build --release
+if [ ! -f "target/release/kazeta-ra" ]; then
+    echo "ERROR: Failed to build kazeta-ra"
+    exit 1
+fi
+cd ..
+
+# Build input daemon
+echo "Building kazeta-input..."
+cd input-daemon
+cargo build --release
+if [ ! -f "target/release/kazeta-input" ]; then
+    echo "ERROR: Failed to build kazeta-input"
+    exit 1
+fi
+cd ..
 
 # chroot into target
 mount --bind ${BUILD_PATH} ${BUILD_PATH}
@@ -250,6 +293,17 @@ btrfs filesystem defragment -r ${BUILD_PATH}
 # copy files into chroot again
 cp -R rootfs/. ${BUILD_PATH}/
 rm -rf ${BUILD_PATH}/extra_certs
+
+# Copy built Rust binaries to the image
+echo "Installing Rust binaries..."
+cp bios/target/release/kazeta-bios ${BUILD_PATH}/usr/bin/
+cp overlay/target/release/kazeta-overlay ${BUILD_PATH}/usr/bin/
+cp ra/target/release/kazeta-ra ${BUILD_PATH}/usr/bin/
+cp input-daemon/target/release/kazeta-input ${BUILD_PATH}/usr/bin/
+chmod +x ${BUILD_PATH}/usr/bin/kazeta-bios
+chmod +x ${BUILD_PATH}/usr/bin/kazeta-overlay
+chmod +x ${BUILD_PATH}/usr/bin/kazeta-ra
+chmod +x ${BUILD_PATH}/usr/bin/kazeta-input
 
 echo "${SYSTEM_NAME}-${VERSION}" > ${BUILD_PATH}/build_info
 echo "" >> ${BUILD_PATH}/build_info

@@ -10,9 +10,19 @@ use crate::{
     FONT_SIZE, MENU_PADDING, MENU_OPTION_HEIGHT, InputState, VideoPlayer,
 };
 
+#[cfg(target_os = "linux")]
 pub const EXTRAS_MENU_OPTIONS: &[&str] = &[
     "CONNECT TO WI-FI",
     "PAIR BLUETOOTH CONTROLLER",
+    "GET NEW THEMES",
+    "DOWNLOAD RUNTIMES",
+    "CD PLAYER",
+    "CHECK FOR UPDATES",
+];
+
+#[cfg(not(target_os = "linux"))]
+pub const EXTRAS_MENU_OPTIONS: &[&str] = &[
+    "CONNECT TO WI-FI",
     "GET NEW THEMES",
     "DOWNLOAD RUNTIMES",
     "CD PLAYER",
@@ -44,6 +54,7 @@ pub fn update(
     }
     if input_state.select {
         sound_effects.play_select(config);
+        #[cfg(target_os = "linux")]
         match *extras_menu_selection {
             0 => *current_screen = Screen::Wifi,
             1 => *current_screen = Screen::Bluetooth,
@@ -51,6 +62,15 @@ pub fn update(
             3 => *current_screen = Screen::RuntimeDownloader,
             4 => *current_screen = Screen::CdPlayer,
             5 => *current_screen = Screen::UpdateChecker,
+            _ => {}
+        }
+        #[cfg(not(target_os = "linux"))]
+        match *extras_menu_selection {
+            0 => *current_screen = Screen::Wifi,
+            1 => *current_screen = Screen::ThemeDownloader,
+            2 => *current_screen = Screen::RuntimeDownloader,
+            3 => *current_screen = Screen::CdPlayer,
+            4 => *current_screen = Screen::UpdateChecker,
             _ => {}
         }
     }
